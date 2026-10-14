@@ -66,10 +66,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 defaults:
   run:
     shell: bash
@@ -140,9 +136,7 @@ jobs:
                   )
               return values
 
-          def platform_targets(env_name, is_enabled):
-              if not is_enabled:
-                  return []
+          def platform_targets(env_name):
               raw = os.environ.get(env_name, "").strip()
               if not raw:
                   raise ValueError(
@@ -209,12 +203,12 @@ jobs:
                   rootfs_matrix = [{"arch": "x86_64", "variant": "full"}]
 
               if enabled("PLATFORMFS_ENABLED"):
-                  platformfs_matrix = platform_targets("PLATFORMFS_TARGETS", True)
+                  platformfs_matrix = platform_targets("PLATFORMFS_TARGETS")
               else:
                   platformfs_matrix = [{"arch": "aarch64", "platform": "rpi"}]
 
               if enabled("SBC_ENABLED"):
-                  sbc_matrix = platform_targets("SBC_TARGETS", True)
+                  sbc_matrix = platform_targets("SBC_TARGETS")
               else:
                   sbc_matrix = [{"arch": "aarch64", "platform": "rpi"}]
 
@@ -277,12 +271,23 @@ jobs:
             '
 
           test -s "${GITHUB_WORKSPACE}/${ISO_NAME}"
+          (cd "${GITHUB_WORKSPACE}" && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256")
+          {
+            echo "### ${ISO_NAME}"
+            echo
+            echo '```text'
+            cat "${GITHUB_WORKSPACE}/${ISO_NAME}.sha256"
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload ISO artifact
         uses: actions/upload-artifact@v7
         with:
           name: chimera-build-iso-${{ matrix.arch }}-${{ matrix.flavor }}-${{ needs.prepare.outputs.datecode }}
-          path: chimera-linux-${{ matrix.arch }}-LIVE-${{ needs.prepare.outputs.datecode }}-${{ matrix.flavor }}.iso
+          path: |
+            chimera-linux-${{ matrix.arch }}-LIVE-${{ needs.prepare.outputs.datecode }}-${{ matrix.flavor }}.iso
+            chimera-linux-${{ matrix.arch }}-LIVE-${{ needs.prepare.outputs.datecode }}-${{ matrix.flavor }}.iso.sha256
           if-no-files-found: error
 
   build-rootfs:
@@ -333,12 +338,23 @@ jobs:
             '
 
           test -s "${GITHUB_WORKSPACE}/${ROOTFS_NAME}"
+          (cd "${GITHUB_WORKSPACE}" && sha256sum "${ROOTFS_NAME}" > "${ROOTFS_NAME}.sha256")
+          {
+            echo "### ${ROOTFS_NAME}"
+            echo
+            echo '```text'
+            cat "${GITHUB_WORKSPACE}/${ROOTFS_NAME}.sha256"
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload ROOTFS artifact
         uses: actions/upload-artifact@v7
         with:
           name: chimera-build-rootfs-${{ matrix.arch }}-${{ matrix.variant }}-${{ needs.prepare.outputs.datecode }}
-          path: chimera-linux-${{ matrix.arch }}-ROOTFS-${{ needs.prepare.outputs.datecode }}-${{ matrix.variant }}.tar.gz
+          path: |
+            chimera-linux-${{ matrix.arch }}-ROOTFS-${{ needs.prepare.outputs.datecode }}-${{ matrix.variant }}.tar.gz
+            chimera-linux-${{ matrix.arch }}-ROOTFS-${{ needs.prepare.outputs.datecode }}-${{ matrix.variant }}.tar.gz.sha256
           if-no-files-found: error
 
   build-platformfs:
@@ -389,18 +405,31 @@ jobs:
             '
 
           test -s "${GITHUB_WORKSPACE}/${ROOTFS_NAME}"
+          (cd "${GITHUB_WORKSPACE}" && sha256sum "${ROOTFS_NAME}" > "${ROOTFS_NAME}.sha256")
+          {
+            echo "### ${ROOTFS_NAME}"
+            echo
+            echo '```text'
+            cat "${GITHUB_WORKSPACE}/${ROOTFS_NAME}.sha256"
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload platform ROOTFS artifact
         uses: actions/upload-artifact@v7
         with:
           name: chimera-build-platformfs-${{ matrix.arch }}-${{ matrix.platform }}-${{ needs.prepare.outputs.datecode }}
-          path: chimera-linux-${{ matrix.arch }}-ROOTFS-${{ needs.prepare.outputs.datecode }}-${{ matrix.platform }}.tar.gz
+          path: |
+            chimera-linux-${{ matrix.arch }}-ROOTFS-${{ needs.prepare.outputs.datecode }}-${{ matrix.platform }}.tar.gz
+            chimera-linux-${{ matrix.arch }}-ROOTFS-${{ needs.prepare.outputs.datecode }}-${{ matrix.platform }}.tar.gz.sha256
           if-no-files-found: error
 
   build-sbc-image:
     name: SBC image — ${{ matrix.arch }} / ${{ matrix.platform }}
-    needs: prepare
-    if: ${{ inputs.sbc_img_flag }}
+    needs:
+      - prepare
+      - build-platformfs
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && inputs.sbc_img_flag }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -422,11 +451,24 @@ jobs:
         with:
           path: chimera-live
 
+      - name: Download matching platform ROOTFS when available
+        if: ${{ inputs.platformfs_flag && contains(format(' {0} ', inputs.platformfs), format(' {0}-{1} ', matrix.arch, matrix.platform)) }}
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: chimera-build-platformfs-${{ matrix.arch }}-${{ matrix.platform }}-${{ needs.prepare.outputs.datecode }}
+          path: shared-rootfs
+
       - name: Build SBC image
         run: |
           set -euo pipefail
           ROOTFS_NAME="chimera-linux-${ARCH}-ROOTFS-${DATE_CODE}-${PLATFORM}.tar.gz"
           IMAGE_NAME="chimera-linux-${ARCH}-IMAGE-${DATE_CODE}-${PLATFORM}.img"
+
+          if [[ -s "${GITHUB_WORKSPACE}/shared-rootfs/${ROOTFS_NAME}" ]]; then
+            cp "${GITHUB_WORKSPACE}/shared-rootfs/${ROOTFS_NAME}" \
+              "${GITHUB_WORKSPACE}/chimera-live/${ROOTFS_NAME}"
+          fi
 
           docker pull chimeralinux/chimera:latest
           docker run --rm \
@@ -436,7 +478,6 @@ jobs:
             --workdir /work/chimera-live \
             --env ARCH="${ARCH}" \
             --env PLATFORM="${PLATFORM}" \
-            --env DATE_CODE="${DATE_CODE}" \
             --env ROOTFS_NAME="${ROOTFS_NAME}" \
             --env IMAGE_NAME="${IMAGE_NAME}" \
             chimeralinux/chimera:latest \
@@ -448,7 +489,9 @@ jobs:
               command -v mkfs.vfat
               command -v mkfs.ext4
 
-              ./mkrootfs-platform.sh -P "$PLATFORM" -- -a "$ARCH" -o "$ROOTFS_NAME"
+              if [ ! -s "$ROOTFS_NAME" ]; then
+                ./mkrootfs-platform.sh -P "$PLATFORM" -- -a "$ARCH" -o "$ROOTFS_NAME"
+              fi
               ./mkimage.sh -o "$IMAGE_NAME" "$ROOTFS_NAME"
               test -s "${IMAGE_NAME}.gz"
               cp "${IMAGE_NAME}.gz" "/work/${IMAGE_NAME}.gz"
@@ -456,71 +499,21 @@ jobs:
             '
 
           test -s "${GITHUB_WORKSPACE}/${IMAGE_NAME}.gz"
+          (cd "${GITHUB_WORKSPACE}" && sha256sum "${IMAGE_NAME}.gz" > "${IMAGE_NAME}.gz.sha256")
+          {
+            echo "### ${IMAGE_NAME}.gz"
+            echo
+            echo '```text'
+            cat "${GITHUB_WORKSPACE}/${IMAGE_NAME}.gz.sha256"
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SBC image artifact
         uses: actions/upload-artifact@v7
         with:
           name: chimera-build-sbc-${{ matrix.arch }}-${{ matrix.platform }}-${{ needs.prepare.outputs.datecode }}
-          path: chimera-linux-${{ matrix.arch }}-IMAGE-${{ needs.prepare.outputs.datecode }}-${{ matrix.platform }}.img.gz
+          path: |
+            chimera-linux-${{ matrix.arch }}-IMAGE-${{ needs.prepare.outputs.datecode }}-${{ matrix.platform }}.img.gz
+            chimera-linux-${{ matrix.arch }}-IMAGE-${{ needs.prepare.outputs.datecode }}-${{ matrix.platform }}.img.gz.sha256
           if-no-files-found: error
-
-  merge-artifacts:
-    name: Combine generated images
-    runs-on: ubuntu-latest
-    needs:
-      - prepare
-      - build-live-iso
-      - build-rootfs
-      - build-platformfs
-      - build-sbc-image
-    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && (inputs.live_iso_flag || inputs.rootfs_flag || inputs.platformfs_flag || inputs.sbc_img_flag) }}
-    steps:
-      - name: Download successful build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: chimera-build-*-${{ needs.prepare.outputs.datecode }}
-          path: dist
-          merge-multiple: true
-
-      - name: Generate SHA-256 checksums
-        id: checksums
-        run: |
-          set -euo pipefail
-          mapfile -t images < <(
-            find dist -maxdepth 1 -type f \
-              \( -name '*.iso' -o -name '*.tar.gz' -o -name '*.img.gz' \) \
-              -printf '%f\n' | sort
-          )
-          if ((${#images[@]} == 0)); then
-            echo "::error::No image artifacts were downloaded. Check the build job logs."
-            exit 1
-          fi
-          (cd dist && sha256sum "${images[@]}" > sha256sums.txt)
-          echo "image_count=${#images[@]}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload combined artifact
-        id: upload
-        uses: actions/upload-artifact@v7
-        with:
-          name: chimera-live-${{ needs.prepare.outputs.datecode }}
-          path: dist/*
-          if-no-files-found: error
-
-      - name: Generate workflow summary
-        env:
-          DATE_CODE: ${{ needs.prepare.outputs.datecode }}
-          IMAGE_COUNT: ${{ steps.checksums.outputs.image_count }}
-          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
-        run: |
-          {
-            echo "## Chimera Linux image build"
-            echo
-            echo "- Datecode: ${DATE_CODE}"
-            echo "- Images collected: ${IMAGE_COUNT}"
-            echo "- Combined artifact: [Download images and checksums](${ARTIFACT_URL})"
-            echo
-            echo "### SHA-256 checksums"
-            echo '```text'
-            cat dist/sha256sums.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
