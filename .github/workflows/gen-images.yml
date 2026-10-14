@@ -1,117 +1,526 @@
-name: Build Chimera images
+name: Build Chimera Linux Images
 
 on:
   workflow_dispatch:
     inputs:
       datecode:
-        description: "Override ISO date (YYYYMMDD)"
+        description: "Override datecode used in output filenames (YYYYMMDD; empty = current UTC date)"
+        required: false
+        type: string
+        default: ""
+
+      live_iso_flag:
+        description: "Build Live ISOs"
+        default: true
+        required: true
+        type: boolean
+      live_archs:
+        description: "Architectures for Live ISOs (space-separated; remove entries you do not want)"
+        default: "x86_64 aarch64 loongarch64 ppc64le riscv64"
+        required: false
+        type: string
+      live_flavors:
+        description: "Flavors for Live ISOs (space-separated; remove entries you do not want)"
+        default: "minimal base gnome plasma"
         required: false
         type: string
 
-      flavor:
-        description: "Live ISO flavor"
+      rootfs_flag:
+        description: "Build generic ROOTFS tarballs"
+        default: true
         required: true
-        type: choice
-        default: minimal
-        options:
-          - minimal
-          - base
-          - gnome
-          - plasma
+        type: boolean
+      rootfs:
+        description: "Architectures for generic ROOTFS tarballs (space-separated)"
+        default: "x86_64 aarch64 loongarch64 ppc64le riscv64"
+        required: false
+        type: string
+      rootfs_variants:
+        description: "Generic ROOTFS variants (space-separated: bootstrap full)"
+        default: "bootstrap full"
+        required: false
+        type: string
 
-concurrency:
-  group: chimera-iso-${{ github.ref }}
-  cancel-in-progress: true
+      platformfs_flag:
+        description: "Build device/platform-specific ROOTFS tarballs"
+        default: true
+        required: true
+        type: boolean
+      platformfs:
+        description: "Device ROOTFS targets (space-separated ARCH-PLATFORM pairs)"
+        default: "aarch64-rpi aarch64-pbp aarch64-quartzpro64 aarch64-rock64 aarch64-rockpro64 riscv64-unmatched"
+        required: false
+        type: string
+
+      sbc_img_flag:
+        description: "Build SBC disk images (.img.gz)"
+        default: true
+        required: true
+        type: boolean
+      sbc_imgs:
+        description: "SBC image targets (space-separated ARCH-PLATFORM pairs)"
+        default: "aarch64-rpi aarch64-pbp aarch64-quartzpro64 aarch64-rock64 aarch64-rockpro64 riscv64-unmatched"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  build-iso:
-    name: Build Live ISO
+  prepare:
+    name: Prepare build matrices
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
-    env:
-      FLAVOR: ${{ inputs.flavor }}
-      INPUT_DATECODE: ${{ inputs.datecode }}
-
+    outputs:
+      datecode: ${{ steps.prepare.outputs.datecode }}
+      live_matrix: ${{ steps.prepare.outputs.live_matrix }}
+      rootfs_matrix: ${{ steps.prepare.outputs.rootfs_matrix }}
+      platformfs_matrix: ${{ steps.prepare.outputs.platformfs_matrix }}
+      sbc_matrix: ${{ steps.prepare.outputs.sbc_matrix }}
     steps:
-      - name: Checkout workflow repository
-        uses: actions/checkout@v4
+      - name: Validate selections and prepare matrices
+        id: prepare
+        env:
+          DATECODE: ${{ inputs.datecode }}
+          LIVE_ENABLED: ${{ inputs.live_iso_flag }}
+          LIVE_ARCHS: ${{ inputs.live_archs }}
+          LIVE_FLAVORS: ${{ inputs.live_flavors }}
+          ROOTFS_ENABLED: ${{ inputs.rootfs_flag }}
+          ROOTFS_ARCHS: ${{ inputs.rootfs }}
+          ROOTFS_VARIANTS_INPUT: ${{ inputs.rootfs_variants }}
+          PLATFORMFS_ENABLED: ${{ inputs.platformfs_flag }}
+          PLATFORMFS_TARGETS: ${{ inputs.platformfs }}
+          SBC_ENABLED: ${{ inputs.sbc_img_flag }}
+          SBC_TARGETS: ${{ inputs.sbc_imgs }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          ARCHITECTURES = [
+              "x86_64",
+              "aarch64",
+              "loongarch64",
+              "ppc64le",
+              "riscv64",
+          ]
+          LIVE_FLAVORS = ["minimal", "base", "gnome", "plasma"]
+          ROOTFS_VARIANTS = ["bootstrap", "full"]
+          PLATFORM_ARCHES = {
+              "aarch64": {"rpi", "pbp", "quartzpro64", "rock64", "rockpro64"},
+              "riscv64": {"unmatched"},
+          }
+
+          def enabled(name):
+              return os.environ.get(name, "false").strip().lower() == "true"
+
+          def tokens(env_name, allowed):
+              raw = os.environ.get(env_name, "").strip()
+              values = list(dict.fromkeys(raw.split()))
+              if not values:
+                  raise ValueError(
+                      f"{env_name} is empty, but its image category is enabled. "
+                      "Enter one or more space-separated values or disable that category."
+                  )
+              invalid = [value for value in values if value not in allowed]
+              if invalid:
+                  raise ValueError(
+                      f"Invalid value(s) in {env_name}: {', '.join(invalid)}. "
+                      f"Allowed values: {' '.join(allowed)}"
+                  )
+              return values
+
+          def platform_targets(env_name, is_enabled):
+              if not is_enabled:
+                  return []
+              raw = os.environ.get(env_name, "").strip()
+              if not raw:
+                  raise ValueError(
+                      f"{env_name} is empty, but its image category is enabled. "
+                      "Enter one or more ARCH-PLATFORM pairs or disable that category."
+                  )
+
+              targets = []
+              seen = set()
+              for item in raw.split():
+                  if "-" not in item:
+                      raise ValueError(
+                          f"Invalid target '{item}' in {env_name}; use ARCH-PLATFORM, "
+                          "for example aarch64-rpi."
+                      )
+                  arch, platform = item.split("-", 1)
+                  if arch not in ARCHITECTURES:
+                      raise ValueError(f"Unsupported architecture '{arch}' in {env_name}.")
+                  if platform not in PLATFORM_ARCHES.get(arch, set()):
+                      valid = sorted(PLATFORM_ARCHES.get(arch, set()))
+                      raise ValueError(
+                          f"Unsupported target '{item}' in {env_name}. "
+                          f"Valid platforms for {arch}: {' '.join(valid) or '(none)'}"
+                      )
+                  pair = (arch, platform)
+                  if pair not in seen:
+                      targets.append({"arch": arch, "platform": platform})
+                      seen.add(pair)
+              return targets
+
+          try:
+              requested_datecode = os.environ.get("DATECODE", "").strip()
+              if requested_datecode:
+                  if not re.fullmatch(r"[0-9]{8}", requested_datecode):
+                      raise ValueError("datecode must use YYYYMMDD format, e.g. 20261014.")
+                  try:
+                      datetime.strptime(requested_datecode, "%Y%m%d")
+                  except ValueError:
+                      raise ValueError("datecode must be a valid calendar date in YYYYMMDD format.")
+                  datecode = requested_datecode
+              else:
+                  datecode = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+              if enabled("LIVE_ENABLED"):
+                  live_archs = tokens("LIVE_ARCHS", ARCHITECTURES)
+                  live_flavors = tokens("LIVE_FLAVORS", LIVE_FLAVORS)
+                  live_matrix = [
+                      {"arch": arch, "flavor": flavor}
+                      for arch in live_archs
+                      for flavor in live_flavors
+                  ]
+              else:
+                  live_matrix = [{"arch": "x86_64", "flavor": "base"}]
+
+              if enabled("ROOTFS_ENABLED"):
+                  rootfs_archs = tokens("ROOTFS_ARCHS", ARCHITECTURES)
+                  rootfs_variants = tokens("ROOTFS_VARIANTS_INPUT", ROOTFS_VARIANTS)
+                  rootfs_matrix = [
+                      {"arch": arch, "variant": variant}
+                      for arch in rootfs_archs
+                      for variant in rootfs_variants
+                  ]
+              else:
+                  rootfs_matrix = [{"arch": "x86_64", "variant": "full"}]
+
+              if enabled("PLATFORMFS_ENABLED"):
+                  platformfs_matrix = platform_targets("PLATFORMFS_TARGETS", True)
+              else:
+                  platformfs_matrix = [{"arch": "aarch64", "platform": "rpi"}]
+
+              if enabled("SBC_ENABLED"):
+                  sbc_matrix = platform_targets("SBC_TARGETS", True)
+              else:
+                  sbc_matrix = [{"arch": "aarch64", "platform": "rpi"}]
+
+          except ValueError as error:
+              print(f"::error::{error}")
+              sys.exit(1)
+
+          print("datecode=" + datecode)
+          print("live_matrix=" + json.dumps({"include": live_matrix}, separators=(",", ":")))
+          print("rootfs_matrix=" + json.dumps({"include": rootfs_matrix}, separators=(",", ":")))
+          print("platformfs_matrix=" + json.dumps({"include": platformfs_matrix}, separators=(",", ":")))
+          print("sbc_matrix=" + json.dumps({"include": sbc_matrix}, separators=(",", ":")))
+          PY
+
+  build-live-iso:
+    name: Live ISO — ${{ matrix.arch }} / ${{ matrix.flavor }}
+    needs: prepare
+    if: ${{ inputs.live_iso_flag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare.outputs.live_matrix) }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      FLAVOR: ${{ matrix.flavor }}
+      DATE_CODE: ${{ needs.prepare.outputs.datecode }}
+    steps:
+      - name: Set up QEMU for cross-architecture builds
+        if: ${{ matrix.arch != 'x86_64' }}
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
 
       - name: Checkout Chimera Live
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          repository: chimera-linux/chimera-live
           path: chimera-live
 
-      - name: Prepare build variables
-        id: prepare
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -n "$INPUT_DATECODE" ]]; then
-            DATECODE="$INPUT_DATECODE"
-          else
-            DATECODE="$(date -u +%Y%m%d)"
-          fi
-
-          if [[ ! "$DATECODE" =~ ^[0-9]{8}$ ]]; then
-            echo "Invalid datecode: expected YYYYMMDD"
-            exit 1
-          fi
-
-          echo "datecode=$DATECODE" >> "$GITHUB_OUTPUT"
-          echo "ISO_DATECODE=$DATECODE" >> "$GITHUB_ENV"
-
       - name: Build ISO
-        shell: bash
         run: |
           set -euo pipefail
-
-          OUTPUT="$GITHUB_WORKSPACE/chimera-linux-x86_64-${ISO_DATECODE}-${FLAVOR}.iso"
+          ISO_NAME="chimera-linux-${ARCH}-LIVE-${DATE_CODE}-${FLAVOR}.iso"
+          OUTPUT="/work/${ISO_NAME}"
 
           docker pull chimeralinux/chimera:latest
-
           docker run --rm \
             --privileged \
             --volume /dev:/dev \
-            --volume "$GITHUB_WORKSPACE:/work" \
+            --volume "${GITHUB_WORKSPACE}:/work" \
             --workdir /work/chimera-live \
-            --env FLAVOR="$FLAVOR" \
-            --env OUTPUT="/work/$(basename "$OUTPUT")" \
+            --env ARCH="${ARCH}" \
+            --env FLAVOR="${FLAVOR}" \
+            --env OUTPUT="${OUTPUT}" \
             chimeralinux/chimera:latest \
             /bin/sh -ec '
               apk add util-linux-mount
-
               command -v mount
-
-              ./mklive-image.sh \
-                -b "$FLAVOR" \
-                -- \
-                -o "$OUTPUT"
+              ./mklive-image.sh -b "$FLAVOR" -- -a "$ARCH" -o "$OUTPUT"
             '
 
-          test -s "$OUTPUT"
+          test -s "${GITHUB_WORKSPACE}/${ISO_NAME}"
 
-      - name: Generate checksum
-        shell: bash
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: chimera-build-iso-${{ matrix.arch }}-${{ matrix.flavor }}-${{ needs.prepare.outputs.datecode }}
+          path: chimera-linux-${{ matrix.arch }}-LIVE-${{ needs.prepare.outputs.datecode }}-${{ matrix.flavor }}.iso
+          if-no-files-found: error
+
+  build-rootfs:
+    name: ROOTFS — ${{ matrix.arch }} / ${{ matrix.variant }}
+    needs: prepare
+    if: ${{ inputs.rootfs_flag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare.outputs.rootfs_matrix) }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      VARIANT: ${{ matrix.variant }}
+      DATE_CODE: ${{ needs.prepare.outputs.datecode }}
+    steps:
+      - name: Set up QEMU for cross-architecture builds
+        if: ${{ matrix.arch != 'x86_64' }}
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+
+      - name: Checkout Chimera Live
+        uses: actions/checkout@v7
+        with:
+          path: chimera-live
+
+      - name: Build ROOTFS tarball
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
+          ROOTFS_NAME="chimera-linux-${ARCH}-ROOTFS-${DATE_CODE}-${VARIANT}.tar.gz"
+          OUTPUT="/work/${ROOTFS_NAME}"
 
-          sha256sum \
-            "chimera-linux-x86_64-${ISO_DATECODE}-${FLAVOR}.iso" \
-            > "chimera-linux-x86_64-${ISO_DATECODE}-${FLAVOR}.iso.sha256"
+          docker pull chimeralinux/chimera:latest
+          docker run --rm \
+            --privileged \
+            --volume /dev:/dev \
+            --volume "${GITHUB_WORKSPACE}:/work" \
+            --workdir /work/chimera-live \
+            --env ARCH="${ARCH}" \
+            --env VARIANT="${VARIANT}" \
+            --env OUTPUT="${OUTPUT}" \
+            chimeralinux/chimera:latest \
+            /bin/sh -ec '
+              apk add util-linux-mount
+              command -v mount
+              ./mkrootfs-platform.sh -P "$VARIANT" -- -a "$ARCH" -o "$OUTPUT"
+            '
 
-      - name: Upload ISO
-        uses: actions/upload-artifact@v4
+          test -s "${GITHUB_WORKSPACE}/${ROOTFS_NAME}"
+
+      - name: Upload ROOTFS artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: chimera-linux-x86_64-${{ steps.prepare.outputs.datecode }}-${{ inputs.flavor }}
-          path: |
-            chimera-linux-x86_64-${{ steps.prepare.outputs.datecode }}-${{ inputs.flavor }}.iso
-            chimera-linux-x86_64-${{ steps.prepare.outputs.datecode }}-${{ inputs.flavor }}.iso.sha256
+          name: chimera-build-rootfs-${{ matrix.arch }}-${{ matrix.variant }}-${{ needs.prepare.outputs.datecode }}
+          path: chimera-linux-${{ matrix.arch }}-ROOTFS-${{ needs.prepare.outputs.datecode }}-${{ matrix.variant }}.tar.gz
           if-no-files-found: error
-          compression-level: 0
+
+  build-platformfs:
+    name: Platform ROOTFS — ${{ matrix.arch }} / ${{ matrix.platform }}
+    needs: prepare
+    if: ${{ inputs.platformfs_flag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare.outputs.platformfs_matrix) }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      PLATFORM: ${{ matrix.platform }}
+      DATE_CODE: ${{ needs.prepare.outputs.datecode }}
+    steps:
+      - name: Set up QEMU for cross-architecture builds
+        if: ${{ matrix.arch != 'x86_64' }}
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+
+      - name: Checkout Chimera Live
+        uses: actions/checkout@v7
+        with:
+          path: chimera-live
+
+      - name: Build platform-specific ROOTFS tarball
+        run: |
+          set -euo pipefail
+          ROOTFS_NAME="chimera-linux-${ARCH}-ROOTFS-${DATE_CODE}-${PLATFORM}.tar.gz"
+          OUTPUT="/work/${ROOTFS_NAME}"
+
+          docker pull chimeralinux/chimera:latest
+          docker run --rm \
+            --privileged \
+            --volume /dev:/dev \
+            --volume "${GITHUB_WORKSPACE}:/work" \
+            --workdir /work/chimera-live \
+            --env ARCH="${ARCH}" \
+            --env PLATFORM="${PLATFORM}" \
+            --env OUTPUT="${OUTPUT}" \
+            chimeralinux/chimera:latest \
+            /bin/sh -ec '
+              apk add util-linux-mount
+              command -v mount
+              ./mkrootfs-platform.sh -P "$PLATFORM" -- -a "$ARCH" -o "$OUTPUT"
+            '
+
+          test -s "${GITHUB_WORKSPACE}/${ROOTFS_NAME}"
+
+      - name: Upload platform ROOTFS artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: chimera-build-platformfs-${{ matrix.arch }}-${{ matrix.platform }}-${{ needs.prepare.outputs.datecode }}
+          path: chimera-linux-${{ matrix.arch }}-ROOTFS-${{ needs.prepare.outputs.datecode }}-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  build-sbc-image:
+    name: SBC image — ${{ matrix.arch }} / ${{ matrix.platform }}
+    needs: prepare
+    if: ${{ inputs.sbc_img_flag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare.outputs.sbc_matrix) }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      PLATFORM: ${{ matrix.platform }}
+      DATE_CODE: ${{ needs.prepare.outputs.datecode }}
+    steps:
+      - name: Set up QEMU for cross-architecture builds
+        if: ${{ matrix.arch != 'x86_64' }}
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+
+      - name: Checkout Chimera Live
+        uses: actions/checkout@v7
+        with:
+          path: chimera-live
+
+      - name: Build SBC image
+        run: |
+          set -euo pipefail
+          ROOTFS_NAME="chimera-linux-${ARCH}-ROOTFS-${DATE_CODE}-${PLATFORM}.tar.gz"
+          IMAGE_NAME="chimera-linux-${ARCH}-IMAGE-${DATE_CODE}-${PLATFORM}.img"
+
+          docker pull chimeralinux/chimera:latest
+          docker run --rm \
+            --privileged \
+            --volume /dev:/dev \
+            --volume "${GITHUB_WORKSPACE}:/work" \
+            --workdir /work/chimera-live \
+            --env ARCH="${ARCH}" \
+            --env PLATFORM="${PLATFORM}" \
+            --env DATE_CODE="${DATE_CODE}" \
+            --env ROOTFS_NAME="${ROOTFS_NAME}" \
+            --env IMAGE_NAME="${IMAGE_NAME}" \
+            chimeralinux/chimera:latest \
+            /bin/sh -ec '
+              apk add util-linux-mount util-linux-fdisk dosfstools e2fsprogs
+              command -v mount
+              command -v losetup
+              command -v sfdisk
+              command -v mkfs.vfat
+              command -v mkfs.ext4
+
+              ./mkrootfs-platform.sh -P "$PLATFORM" -- -a "$ARCH" -o "$ROOTFS_NAME"
+              ./mkimage.sh -o "$IMAGE_NAME" "$ROOTFS_NAME"
+              test -s "${IMAGE_NAME}.gz"
+              cp "${IMAGE_NAME}.gz" "/work/${IMAGE_NAME}.gz"
+              rm -f "$ROOTFS_NAME" "${IMAGE_NAME}.gz"
+            '
+
+          test -s "${GITHUB_WORKSPACE}/${IMAGE_NAME}.gz"
+
+      - name: Upload SBC image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: chimera-build-sbc-${{ matrix.arch }}-${{ matrix.platform }}-${{ needs.prepare.outputs.datecode }}
+          path: chimera-linux-${{ matrix.arch }}-IMAGE-${{ needs.prepare.outputs.datecode }}-${{ matrix.platform }}.img.gz
+          if-no-files-found: error
+
+  merge-artifacts:
+    name: Combine generated images
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - build-live-iso
+      - build-rootfs
+      - build-platformfs
+      - build-sbc-image
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && (inputs.live_iso_flag || inputs.rootfs_flag || inputs.platformfs_flag || inputs.sbc_img_flag) }}
+    steps:
+      - name: Download successful build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: chimera-build-*-${{ needs.prepare.outputs.datecode }}
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        id: checksums
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(
+            find dist -maxdepth 1 -type f \
+              \( -name '*.iso' -o -name '*.tar.gz' -o -name '*.img.gz' \) \
+              -printf '%f\n' | sort
+          )
+          if ((${#images[@]} == 0)); then
+            echo "::error::No image artifacts were downloaded. Check the build job logs."
+            exit 1
+          fi
+          (cd dist && sha256sum "${images[@]}" > sha256sums.txt)
+          echo "image_count=${#images[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload combined artifact
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: chimera-live-${{ needs.prepare.outputs.datecode }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Generate workflow summary
+        env:
+          DATE_CODE: ${{ needs.prepare.outputs.datecode }}
+          IMAGE_COUNT: ${{ steps.checksums.outputs.image_count }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            echo "## Chimera Linux image build"
+            echo
+            echo "- Datecode: ${DATE_CODE}"
+            echo "- Images collected: ${IMAGE_COUNT}"
+            echo "- Combined artifact: [Download images and checksums](${ARTIFACT_URL})"
+            echo
+            echo "### SHA-256 checksums"
+            echo '```text'
+            cat dist/sha256sums.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
