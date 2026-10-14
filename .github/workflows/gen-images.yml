@@ -1,0 +1,113 @@
+name: Build Chimera images
+
+on:
+  workflow_dispatch:
+    inputs:
+      datecode:
+        description: "Override ISO date (YYYYMMDD)"
+        required: false
+        type: string
+
+      flavor:
+        description: "Live ISO flavor"
+        required: true
+        type: choice
+        default: minimal
+        options:
+          - minimal
+          - base
+          - gnome
+          - plasma
+
+concurrency:
+  group: chimera-iso-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-iso:
+    name: Build Live ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      FLAVOR: ${{ inputs.flavor }}
+      INPUT_DATECODE: ${{ inputs.datecode }}
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Checkout Chimera Live
+        uses: actions/checkout@v4
+        with:
+          repository: chimera-linux/chimera-live
+          path: chimera-live
+
+      - name: Prepare build variables
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$INPUT_DATECODE" ]]; then
+            DATECODE="$INPUT_DATECODE"
+          else
+            DATECODE="$(date -u +%Y%m%d)"
+          fi
+
+          if [[ ! "$DATECODE" =~ ^[0-9]{8}$ ]]; then
+            echo "Invalid datecode: expected YYYYMMDD"
+            exit 1
+          fi
+
+          echo "datecode=$DATECODE" >> "$GITHUB_OUTPUT"
+          echo "ISO_DATECODE=$DATECODE" >> "$GITHUB_ENV"
+
+      - name: Build ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUTPUT="$GITHUB_WORKSPACE/chimera-linux-x86_64-${ISO_DATECODE}-${FLAVOR}.iso"
+
+          docker pull chimeralinux/chimera:latest
+
+          docker run --rm \
+            --privileged \
+            --volume /dev:/dev \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work/chimera-live \
+            --env FLAVOR="$FLAVOR" \
+            --env OUTPUT="/work/$(basename "$OUTPUT")" \
+            chimeralinux/chimera:latest \
+            /bin/sh -ec '
+              ./mklive-image.sh \
+                -b "$FLAVOR" \
+                -- \
+                -o "$OUTPUT"
+            '
+
+          test -s "$OUTPUT"
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          sha256sum \
+            "chimera-linux-x86_64-${ISO_DATECODE}-${FLAVOR}.iso" \
+            > "chimera-linux-x86_64-${ISO_DATECODE}-${FLAVOR}.iso.sha256"
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: chimera-linux-x86_64-${{ steps.prepare.outputs.datecode }}-${{ inputs.flavor }}
+          path: |
+            chimera-linux-x86_64-${{ steps.prepare.outputs.datecode }}-${{ inputs.flavor }}.iso
+            chimera-linux-x86_64-${{ steps.prepare.outputs.datecode }}-${{ inputs.flavor }}.iso.sha256
+          if-no-files-found: error
+          compression-level: 0
